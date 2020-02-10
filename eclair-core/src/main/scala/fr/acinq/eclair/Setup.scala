@@ -164,9 +164,28 @@ class Setup(datadir: File,
           case "testnet" => bitcoinClient.invoke("getrawtransaction", "8f38a0dd41dc0ae7509081e262d791f8d53ed6f884323796d5ec7b0966dd3825") // coinbase of #1500000
           case "regtest" => Future.successful(())
         }
-      } yield (progress, ibd, chainHash, bitcoinVersion, unspentAddresses, blocks, headers)
+        zmq <- bitcoinClient.invoke("getzmqnotifications")
+
+        zmqBlocks = if (config.getIsNull("bitcoind.zmqblock")) {
+          zmq.children.find(json => (json \ "type").extract[String] == "pubrawblock") match {
+            case None => throw BitcoinZMQDisabledException
+            case Some(value) => (value \ "address").extract[String]
+          }
+        } else {
+          config.getString("bitcoind.zmqblock")
+        }
+        zmqTxs = if (config.getIsNull("bitcoind.zmqtx")) {
+          zmq.children.find(json => (json \ "type").extract[String] == "pubrawtx") match {
+            case None => throw BitcoinZMQDisabledException
+            case Some(value) => (value \ "address").extract[String]
+          }
+        } else {
+          config.getString("bitcoind.zmqtx")
+        }
+
+      } yield (progress, ibd, chainHash, bitcoinVersion, unspentAddresses, blocks, headers,zmqTxs, zmqBlocks)
       // blocking sanity checks
-      val (progress, initialBlockDownload, chainHash, bitcoinVersion, unspentAddresses, blocks, headers) = await(future, 30 seconds, "bicoind did not respond after 30 seconds")
+      val (progress, initialBlockDownload, chainHash, bitcoinVersion, unspentAddresses, blocks, headers, zmqTxs, zmqBlocks) = await(future, 30 seconds, "bicoind did not respond after 30 seconds")
       assert(bitcoinVersion >= 170000, "Eclair requires Bitcoin Core 0.17.0 or higher")
       assert(chainHash == nodeParams.chainHash, s"chainHash mismatch (conf=${nodeParams.chainHash} != bitcoind=$chainHash)")
       if (chainHash != Block.RegtestGenesisBlock.hash) {
@@ -175,7 +194,7 @@ class Setup(datadir: File,
       assert(!initialBlockDownload, s"bitcoind should be synchronized (initialblockdownload=$initialBlockDownload)")
       assert(progress > 0.999, s"bitcoind should be synchronized (progress=$progress)")
       assert(headers - blocks <= 1, s"bitcoind should be synchronized (headers=$headers blocks=$blocks)")
-      Bitcoind(bitcoinClient)
+      Bitcoind(bitcoinClient,zmqBlocks,zmqTxs)
     case ELECTRUM =>
       val addresses = config.hasPath("electrum") match {
         case true =>
@@ -233,7 +252,7 @@ class Setup(datadir: File,
       readTimeout = FiniteDuration(config.getDuration("feerate-provider-timeout", TimeUnit.MILLISECONDS), TimeUnit.MILLISECONDS)
       feeProvider = (nodeParams.chainHash, bitcoin) match {
         case (Block.RegtestGenesisBlock.hash, _) => new FallbackFeeProvider(new ConstantFeeProvider(defaultFeerates) :: Nil, minFeeratePerByte)
-        case (_, Bitcoind(bitcoinClient)) =>
+        case (_, Bitcoind(bitcoinClient,_ ,_)) =>
           new FallbackFeeProvider(new SmoothFeeProvider(new BitcoinCoreFeeProvider(bitcoinClient, defaultFeerates), smoothFeerateWindow) :: new SmoothFeeProvider(new BitgoFeeProvider(nodeParams.chainHash, readTimeout), smoothFeerateWindow) :: new SmoothFeeProvider(new EarnDotComFeeProvider(readTimeout), smoothFeerateWindow) :: new ConstantFeeProvider(defaultFeerates) :: Nil, minFeeratePerByte) // order matters!
         case _ =>
           new FallbackFeeProvider(new SmoothFeeProvider(new BitgoFeeProvider(nodeParams.chainHash, readTimeout), smoothFeerateWindow) :: new SmoothFeeProvider(new EarnDotComFeeProvider(readTimeout), smoothFeerateWindow) :: new ConstantFeeProvider(defaultFeerates) :: Nil, minFeeratePerByte) // order matters!
@@ -249,9 +268,9 @@ class Setup(datadir: File,
       _ <- feeratesRetrieved.future
 
       watcher = bitcoin match {
-        case Bitcoind(bitcoinClient) =>
-          system.actorOf(SimpleSupervisor.props(Props(new ZMQActor(config.getString("bitcoind.zmqblock"), Some(zmqBlockConnected))), "zmqblock", SupervisorStrategy.Restart))
-          system.actorOf(SimpleSupervisor.props(Props(new ZMQActor(config.getString("bitcoind.zmqtx"), Some(zmqTxConnected))), "zmqtx", SupervisorStrategy.Restart))
+        case Bitcoind(bitcoinClient,zmqTxs,zmqBlocks) =>
+          system.actorOf(SimpleSupervisor.props(Props(new ZMQActor(zmqBlocks, Some(zmqBlockConnected))), "zmqblock", SupervisorStrategy.Restart))
+          system.actorOf(SimpleSupervisor.props(Props(new ZMQActor(zmqTxs, Some(zmqTxConnected))), "zmqtx", SupervisorStrategy.Restart))
           system.actorOf(SimpleSupervisor.props(ZmqWatcher.props(blockCount, new ExtendedBitcoinClient(new BatchingBitcoinJsonRPCClient(bitcoinClient))), "watcher", SupervisorStrategy.Resume))
         case Electrum(electrumClient) =>
           zmqBlockConnected.success(Done)
@@ -264,7 +283,7 @@ class Setup(datadir: File,
       _ <- Future.firstCompletedOf(routerInitialized.future :: routerTimeout :: Nil)
 
       wallet = bitcoin match {
-        case Bitcoind(bitcoinClient) => new BitcoinCoreWallet(bitcoinClient)
+        case Bitcoind(bitcoinClient, _, _) => new BitcoinCoreWallet(bitcoinClient)
         case Electrum(electrumClient) =>
           val sqlite = DriverManager.getConnection(s"jdbc:sqlite:${new File(chaindir, "wallet.sqlite")}")
           val walletDb = new SqliteWalletDb(sqlite)
@@ -359,7 +378,7 @@ class Setup(datadir: File,
 
 // @formatter:off
 sealed trait Bitcoin
-case class Bitcoind(bitcoinClient: BasicBitcoinJsonRPCClient) extends Bitcoin
+case class Bitcoind(bitcoinClient: BasicBitcoinJsonRPCClient, zmqTxs: String, zmqBlocks: String) extends Bitcoin
 case class Electrum(electrumClient: ActorRef) extends Bitcoin
 // @formatter:on
 
@@ -387,3 +406,5 @@ case object EmptyAPIPasswordException extends RuntimeException("must set a passw
 case object IncompatibleDBException extends RuntimeException("database is not compatible with this version of eclair")
 
 case object IncompatibleNetworkDBException extends RuntimeException("network database is not compatible with this version of eclair")
+
+case object BitcoinZMQDisabledException extends RuntimeException("bitcoind must have zmq enabled")
